@@ -1,0 +1,497 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <DHT.h>
+
+// ==========================================
+// 1. PIN CONFIGURATION
+// ==========================================
+#define PIN_TRIG        5     // Ultrasonic Trigger
+#define PIN_ECHO        18    // Ultrasonic Echo
+#define PIN_DHT         4     // DHT11 Data Pin
+#define PIN_POT         34    // Potentiometer (ADC1_CH6)
+
+#define PIN_BTN_SYS     19    // Button 1: System ON/OFF / SAVE
+#define PIN_BTN_MODE    23    // Button 2: Switch OLED Mode / EDIT / INCREASE
+#define PIN_BTN_RESET   15    // Button 3: Reset Sitting Timer / DECREASE
+
+#define PIN_LED_G       25    
+#define PIN_LED_Y       26   
+#define PIN_LED_R       27    
+
+// IC L293D ควบคุมพัดลม DC Fan
+#define PIN_FAN_EN      33    // ขา 1,2EN 
+#define PIN_FAN_IN1     16    // ขา 1A ของ IC 
+#define PIN_FAN_IN2     17    // ขา 2A ของ IC 
+#define PIN_BUZZER      14    
+
+// ==========================================
+// 2. CONSTANTS & DEFINITIONS
+// ==========================================
+#define SCREEN_WIDTH    128
+#define SCREEN_HEIGHT   64
+#define OLED_RESET      -1
+#define SCREEN_ADDRESS  0x3C
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+#define DHTTYPE DHT11
+DHT dht(PIN_DHT, DHTTYPE);
+
+
+#define PWM_FREQ        5000 // ช่องสัญญาณ Hardware PWM ของ ESP32
+#define PWM_RES         8
+#define CH_FAN          1     // Channel 1 สำหรับพัดลม
+#define CH_BUZZER       2     // Channel 2 สำหรับลำโพง Buzzer
+
+#define DISTANCE_THRESHOLD 120// เซนติเมตร (ระยะตรวจจับว่ามีคนนั่ง)
+#define BEEP_FREQUENCY     2000  
+#define BEEP_DURATION      150   
+
+// DEMO_MODE: true = หน่วยเป็นวินาที, false = หน่วยเป็นนาที
+bool DEMO_MODE = true;
+unsigned long TIME_WARNING = 15;
+unsigned long TIME_BREAK   = 30;
+
+void setupDemoMode() {
+  if (DEMO_MODE) {
+    TIME_WARNING = 15;
+    TIME_BREAK   = 30;
+  } else {
+    TIME_WARNING = 20 * 60; // 20 นาที 
+    TIME_BREAK   = 30 * 60; // 30 นาที
+  }
+}
+
+// ==========================================
+// 3. GLOBAL VARIABLES & BUTTON STATES
+// ==========================================
+bool sysPower = true;
+int  oledPage = 0;
+
+// โหมดแก้ไขเวลา (Edit Mode)
+bool isEditMode = false;
+unsigned long editTimeBreak = 30; // ตัวแปรเก็บเวลาชั่วคราวระหว่างปรับแต่ง
+
+// ตัวแปรจับเวลาปุ่มกด (Non-blocking Button Scanner)
+unsigned long pressTimeSys = 0;
+bool holdTriggeredSys = false;
+
+unsigned long pressTimeMode = 0;
+bool holdTriggeredMode = false;
+
+unsigned long pressTimeReset = 0;
+bool holdTriggeredReset = false;
+
+const unsigned long LONG_PRESS_TIME = 2000; // กดค้าง 2 วินาที
+const unsigned long DEBOUNCE_TIME   = 50;   // กรองสัญญาณกระดอน 50 ms
+
+unsigned long totalSittingSeconds = 0;
+bool isSitting = false;
+bool isRedAlert = false;
+float currentTemp = 0.0;
+float currentHumidity = 0.0;
+int fanDuty = 0;
+int potRawValue = 0;
+long distanceCm = 0;
+
+// ตัวจับเวลา Non-blocking (millis)
+unsigned long lastTimerTick   = 0;
+unsigned long lastSensorRead  = 0;
+unsigned long lastDisplayTick = 0;
+unsigned long lastSerialLog   = 0;
+
+unsigned long lastBeepCycleStart = 0;
+bool isBeeping = false;
+
+// ==========================================
+// 4. HELPER & SOUND FUNCTIONS
+// ==========================================
+long readUltrasonicDistance() {
+  digitalWrite(PIN_TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(PIN_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(PIN_TRIG, LOW);
+  long duration = pulseIn(PIN_ECHO, HIGH, 30000);
+  if (duration == 0) return 999;
+  return duration * 0.034 / 2;
+}
+
+void setFanMotor(int duty) {
+  if (duty > 0) {
+    digitalWrite(PIN_FAN_IN1, HIGH);
+    digitalWrite(PIN_FAN_IN2, LOW);
+    ledcWrite(CH_FAN, duty);
+  } else {
+    ledcWrite(CH_FAN, 0);
+    digitalWrite(PIN_FAN_IN1, LOW);
+    digitalWrite(PIN_FAN_IN2, LOW);
+  }
+}
+
+void playBuzzerTone(unsigned int freq) {
+  if (freq == 0) {
+    ledcWriteTone(CH_BUZZER, 0);
+    ledcWrite(CH_BUZZER, 0);
+  } else {
+    ledcWriteTone(CH_BUZZER, freq);
+  }
+}
+
+void stopBuzzer() {
+  ledcWriteTone(CH_BUZZER, 0);
+  ledcWrite(CH_BUZZER, 0);
+}
+
+void handleBuzzerAlert() {
+  if (sysPower && isSitting && isRedAlert && !isEditMode) {
+    unsigned long currentMillis = millis();
+
+    if (currentMillis - lastBeepCycleStart >= 1000) {
+      lastBeepCycleStart = currentMillis;
+      playBuzzerTone(BEEP_FREQUENCY);
+      isBeeping = true;
+    }
+
+    if (isBeeping && (currentMillis - lastBeepCycleStart >= BEEP_DURATION)) {
+      stopBuzzer();
+      isBeeping = false;
+    }
+  } else {
+    if (isBeeping) {
+      stopBuzzer();
+      isBeeping = false;
+    }
+  }
+}
+
+void updateTrafficLED(unsigned long sittingTime) {
+  if (!sysPower || !isSitting || isEditMode) {
+    digitalWrite(PIN_LED_G, LOW);
+    digitalWrite(PIN_LED_Y, LOW);
+    digitalWrite(PIN_LED_R, LOW);
+    isRedAlert = false;
+    return;
+  }
+
+  if (sittingTime < TIME_WARNING) {
+    digitalWrite(PIN_LED_G, HIGH);
+    digitalWrite(PIN_LED_Y, LOW);
+    digitalWrite(PIN_LED_R, LOW);
+    isRedAlert = false;
+  } else if (sittingTime < TIME_BREAK) {
+    digitalWrite(PIN_LED_G, LOW);
+    digitalWrite(PIN_LED_Y, HIGH);
+    digitalWrite(PIN_LED_R, LOW);
+    isRedAlert = false;
+  } else {
+    digitalWrite(PIN_LED_G, LOW);
+    digitalWrite(PIN_LED_Y, LOW);
+    digitalWrite(PIN_LED_R, HIGH);
+    isRedAlert = true;
+  }
+}
+
+void updateOLED() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  if (!sysPower) {
+    display.setTextSize(1);
+    display.setCursor(20, 26);
+    display.println("SYSTEM STANDBY");
+    display.display();
+    return;
+  }
+
+  // หน้าจอตอนอยู่ใน Edit Mode
+  if (isEditMode) {
+    display.setTextSize(1);
+    display.setCursor(16, 0);
+    display.print("--- EDIT TIMER ---");
+
+    char timeStr[10];
+    int mins = editTimeBreak / 60;
+    int secs = editTimeBreak % 60;
+    sprintf(timeStr, "%02d:%02d", mins, secs);
+
+    display.setTextSize(2);
+    display.setCursor(32, 18);
+    display.print(timeStr);
+
+    display.setTextSize(1);
+    display.setCursor(0, 40);
+    display.print("M:+ R:- | Sys:Save");
+    display.setCursor(0, 52);
+    display.print("Hold M:Exit R:Clear");
+    display.display();
+    return;
+  }
+
+  // หน้าจอแสดงผลปกติ
+  if (oledPage == 0) {
+    display.setTextSize(1);
+    display.setCursor(19, 0);
+    if (DEMO_MODE) {
+      display.print("SITTING TIMER DEMO");
+    } else {
+      display.print("SITTING TIMER");
+    }
+
+    char timeStr[10];
+    int mins = totalSittingSeconds / 60;
+    int secs = totalSittingSeconds % 60;
+    sprintf(timeStr, "%02d:%02d", mins, secs);
+
+    display.setTextSize(2);
+    display.setCursor(32, 20);
+    display.print(timeStr);
+
+    display.setTextSize(1);
+    display.setCursor(15, 45);
+    if (!isSitting) {
+      display.print("STATUS: AWAY/HOLD");
+    } else if (totalSittingSeconds < TIME_WARNING) {
+      display.print("STATUS: NORMAL");
+    } else if (totalSittingSeconds < TIME_BREAK) {
+      display.print("STATUS: WARNING!");
+    } else {
+      display.setCursor(7, 45);
+      display.print("STATUS: TAKE A BREAK");
+    }
+  } else {
+    display.setTextSize(1);
+    display.setCursor(25, 0);
+    display.println("ENVIRONMENT");
+
+    display.setCursor(0, 18);
+    display.printf("Temp:   %.1f C\n", currentTemp);
+    display.setCursor(0, 30);
+    display.printf("Humid:  %.1f %%\n", currentHumidity);
+    display.setCursor(0, 42);
+    int fanPercent = map(fanDuty, 0, 255, 0, 100);
+    display.printf("Fan:    %d %%\n", fanPercent);
+    display.setCursor(0, 54);
+    display.printf("Break Target: %02lu:%02lu\n", TIME_BREAK / 60, TIME_BREAK % 60);
+  }
+  display.display();
+}
+
+// ==========================================
+// 5. BUTTON SCANNER (SHORT vs LONG PRESS)
+// ==========================================
+void handleButtons() {
+  unsigned long now = millis();
+  unsigned long stepVal = DEMO_MODE ? 5 : 60; // กดเพิ่ม/ลดทีละ 5 วิ (Demo) หรือ 1 นาที (โหมดปกติ)
+
+  // ----------------------------------------------------
+  // ปุ่ม 1: BTN System (GPIO 19)
+  // ----------------------------------------------------
+  int sysState = digitalRead(PIN_BTN_SYS);
+  if (sysState == LOW && pressTimeSys == 0) {
+    pressTimeSys = now;
+    holdTriggeredSys = false;
+  }
+  if (sysState == LOW && !holdTriggeredSys && (now - pressTimeSys >= LONG_PRESS_TIME)) {
+    holdTriggeredSys = true;
+    if (!isEditMode) {
+      // โหมดปกติ: กดค้าง 2 วิ สลับ DEMO_MODE
+      DEMO_MODE = !DEMO_MODE;
+      setupDemoMode();
+      Serial.println("[ACTION] Toggled DEMO_MODE");
+    }
+  }
+  if (sysState == HIGH && pressTimeSys > 0) {
+    if (!holdTriggeredSys && (now - pressTimeSys >= DEBOUNCE_TIME)) {
+      if (isEditMode) {
+        // ใน Edit Mode: กดสั้น = SAVE ค่าใหม่
+        TIME_BREAK = editTimeBreak;
+        TIME_WARNING = TIME_BREAK / 2; // คำนวณเตือนสีเหลืองที่ครึ่งหนึ่งของเวลานั่ง
+        isEditMode = false;
+        Serial.printf("[ACTION] Saved New Break Time: %lu s\n", TIME_BREAK);
+      } else {
+        // โหมดปกติ: กดสั้น = เปิด/ปิดระบบ
+        sysPower = !sysPower;
+      }
+    }
+    pressTimeSys = 0;
+  }
+
+  // ----------------------------------------------------
+  // ปุ่ม 2: BTN Mode (GPIO 23)
+  // ----------------------------------------------------
+  int modeState = digitalRead(PIN_BTN_MODE);
+  if (modeState == LOW && pressTimeMode == 0) {
+    pressTimeMode = now;
+    holdTriggeredMode = false;
+  }
+  if (modeState == LOW && !holdTriggeredMode && (now - pressTimeMode >= LONG_PRESS_TIME)) { // Long press = 2 seconds
+    holdTriggeredMode = true;
+    if (!isEditMode) {
+      isEditMode = true;  // โหมดปกติ: กดค้าง 2 วิ = เข้าสู่ Edit Mode
+      editTimeBreak = TIME_BREAK; // ดึงค่าปัจจุบันมาตั้งต้น
+      Serial.println("[ACTION] Entered Edit Mode");
+    } else {
+      isEditMode = false; // อยู่ใน Edit Mode: กดค้าง 2 วิ = ออกจาก Edit Mode (ไม่บันทึก)
+      Serial.println("[ACTION] Exited Edit Mode (Discarded)");
+    }
+  }
+  if (modeState == HIGH && pressTimeMode > 0) {
+    if (!holdTriggeredMode && (now - pressTimeMode >= DEBOUNCE_TIME)) {
+      if (isEditMode) {
+        editTimeBreak += stepVal; // ใน Edit Mode: กดสั้น = เพิ่มเวลา
+        if (editTimeBreak > 7200) editTimeBreak = 7200; // สูงสุด 2 ชั่วโมง
+      } else {
+        oledPage = (oledPage + 1) % 2; // โหมดปกติ: กดสั้น = สลับหน้าจอ OLED
+      }
+    }
+    pressTimeMode = 0;
+  }
+
+  // ----------------------------------------------------
+  // ปุ่ม 3: BTN Reset (GPIO 15)
+  // ----------------------------------------------------
+  int resetState = digitalRead(PIN_BTN_RESET);
+  if (resetState == LOW && pressTimeReset == 0) {
+    pressTimeReset = now;
+    holdTriggeredReset = false;
+  }
+  if (resetState == LOW && !holdTriggeredReset && (now - pressTimeReset >= LONG_PRESS_TIME)) {
+    holdTriggeredReset = true;
+    if (isEditMode) {    
+      editTimeBreak = 0; // ใน Edit Mode: กดค้าง 2 วิ = รีเซ็ตค่าที่จะ Edit เป็น 00:00
+      Serial.println("[ACTION] Reset Edit Target to 00:00");
+    }
+  }
+  if (resetState == HIGH && pressTimeReset > 0) {
+    if (!holdTriggeredReset && (now - pressTimeReset >= DEBOUNCE_TIME)) {
+      if (isEditMode) {
+        if (editTimeBreak >= stepVal) { // ใน Edit Mode: กดสั้น = ลดเวลา
+          editTimeBreak -= stepVal;
+        } else {
+          editTimeBreak = 0;
+        }
+      } else {
+        totalSittingSeconds = 0;  // โหมดปกติ: กดสั้น = รีเซ็ตเวลานั่งสะสมเป็น 00:00
+        isRedAlert = false; 
+        stopBuzzer();
+        Serial.println("[ACTION] Sitting Timer Reset to 00:00");
+      }
+    }
+    pressTimeReset = 0;
+  }
+}
+
+// ==========================================
+// 6. SETUP
+// ==========================================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(PIN_TRIG, OUTPUT);
+  pinMode(PIN_ECHO, INPUT);
+  pinMode(PIN_LED_G, OUTPUT);
+  pinMode(PIN_LED_Y, OUTPUT);
+  pinMode(PIN_LED_R, OUTPUT);
+
+  pinMode(PIN_FAN_IN1, OUTPUT);
+  pinMode(PIN_FAN_IN2, OUTPUT);
+
+
+  pinMode(PIN_BTN_SYS, INPUT_PULLUP);
+  pinMode(PIN_BTN_MODE, INPUT_PULLUP);
+  pinMode(PIN_BTN_RESET, INPUT_PULLUP);
+
+  // PWM สำหรับพัดลม
+  ledcSetup(CH_FAN, PWM_FREQ, PWM_RES);
+  ledcAttachPin(PIN_FAN_EN, CH_FAN);
+  setFanMotor(0);
+
+  // PWM สำหรับ Buzzer
+  ledcSetup(CH_BUZZER, 2000, PWM_RES);
+  ledcAttachPin(PIN_BUZZER, CH_BUZZER);
+  stopBuzzer();
+
+  dht.begin();
+  if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    Serial.println(F("SSD1306 allocation failed"));
+  }
+
+  display.clearDisplay();
+  display.display();
+
+  setupDemoMode();
+  Serial.println("System Ready with Interactive Edit Mode.");
+}
+
+// ==========================================
+// 7. MAIN LOOP
+// ==========================================
+void loop() {
+  unsigned long currentMillis = millis();
+
+ 
+  handleButtons();
+  handleBuzzerAlert();
+
+  // Task 1: ตรวจสอบระยะและจับเวลานั่ง (ทุก 1 วินาที)
+  if (currentMillis - lastTimerTick >= 1000) {
+    lastTimerTick = currentMillis;
+
+    if (sysPower && !isEditMode) {
+      distanceCm = readUltrasonicDistance();
+
+      if (distanceCm > 0 && distanceCm < DISTANCE_THRESHOLD) {
+        isSitting = true;
+        totalSittingSeconds++;
+      } else {
+        isSitting = false;
+      }
+
+      updateTrafficLED(totalSittingSeconds);
+    } else {
+      updateTrafficLED(0);
+      stopBuzzer();
+    }
+  }
+
+
+  if (currentMillis - lastSensorRead >= 500) {   // Task 2: อ่านเซนเซอร์ DHT11 และคุมพัดลมด้วย Potentiometer 
+    lastSensorRead = currentMillis;
+
+    if (sysPower) {
+      float t = dht.readTemperature();
+      float h = dht.readHumidity();
+      if (!isnan(t)) currentTemp = t;
+      if (!isnan(h)) currentHumidity = h;
+
+      // ปรับความแรงพัดลมด้วย Potentiometer โดยตรง
+      potRawValue = analogRead(PIN_POT);
+      if (potRawValue < 50) {
+        fanDuty = 0;
+      } else {
+        fanDuty = map(potRawValue, 50, 4095, 0, 255);
+        fanDuty = constrain(fanDuty, 0, 255);
+      }
+      setFanMotor(fanDuty);
+    } else {
+      fanDuty = 0;
+      setFanMotor(0);
+    }
+  }
+
+  // Task 3: อัปเดตจอ OLED (ทุก 200 ms)
+  if (currentMillis - lastDisplayTick >= 200) {
+    lastDisplayTick = currentMillis;
+    updateOLED();
+  }
+
+  // Task 4: ส่งข้อมูลขึ้น Serial Monitor (ทุก 2 วินาที)
+  if (currentMillis - lastSerialLog >= 2000) {
+    lastSerialLog = currentMillis;
+    if (sysPower) {
+      Serial.printf("[LOG] SitTime: %lu s | Target: %lu s | Temp: %.1f C | FanDuty: %d | EditMode: %d\n",
+                    totalSittingSeconds, TIME_BREAK, currentTemp, fanDuty, isEditMode);
+    }
+  }
+}
