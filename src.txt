@@ -43,7 +43,7 @@ DHT dht(PIN_DHT, DHTTYPE);
 #define CH_FAN          1     // Channel 1 สำหรับพัดลม
 #define CH_BUZZER       2     // Channel 2 สำหรับลำโพง Buzzer
 
-#define DISTANCE_THRESHOLD 120// เซนติเมตร (ระยะตรวจจับว่ามีคนนั่ง)
+
 #define BEEP_FREQUENCY     2000  
 #define BEEP_DURATION      150   
 
@@ -51,14 +51,17 @@ DHT dht(PIN_DHT, DHTTYPE);
 bool DEMO_MODE = true;
 unsigned long TIME_WARNING = 15;
 unsigned long TIME_BREAK   = 30;
+int DISTANCE_THRESHOLD; // เซนติเมตร (ระยะตรวจจับว่ามีคนนั่ง)
 
 void setupDemoMode() {
   if (DEMO_MODE) {
     TIME_WARNING = 15;
     TIME_BREAK   = 30;
+    DISTANCE_THRESHOLD = 9;// เซนติเมตร (ระยะตรวจจับว่ามีคนนั่ง) DEMO_MODE
   } else {
     TIME_WARNING = 20 * 60; // 20 นาที 
     TIME_BREAK   = 30 * 60; // 30 นาที
+    DISTANCE_THRESHOLD = 80 ; // เซนติเมตร (ระยะตรวจจับว่ามีคนนั่ง)
   }
 }
 
@@ -94,7 +97,6 @@ int fanDuty = 0;
 int potRawValue = 0;
 long distanceCm = 0;
 
-// ตัวจับเวลา Non-blocking (millis)
 unsigned long lastTimerTick   = 0;
 unsigned long lastSensorRead  = 0;
 unsigned long lastDisplayTick = 0;
@@ -228,7 +230,7 @@ void updateOLED() {
     return;
   }
 
-  // หน้าจอแสดงผลปกติ
+  
   if (oledPage == 0) {
     display.setTextSize(1);
     display.setCursor(19, 0);
@@ -465,7 +467,7 @@ void loop() {
       if (!isnan(t)) currentTemp = t;
       if (!isnan(h)) currentHumidity = h;
 
-      // ปรับความแรงพัดลมด้วย Potentiometer โดยตรง
+      // ปรับความแรงพัดลมด้วย Potentiometer 
       potRawValue = analogRead(PIN_POT);
       if (potRawValue < 50) {
         fanDuty = 0;
